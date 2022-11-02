@@ -2,7 +2,6 @@
 
 package com.smartmi.loopvideo.compose.page.home
 
-import android.widget.Toast
 import androidx.compose.animation.ExperimentalAnimationApi
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
@@ -33,7 +32,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.smartmi.loopvideo.bean.RemoteConfig
 import com.smartmi.loopvideo.network.download.Downloader
-import com.smartmi.loopvideo.network.download.FileMananger
+import com.smartmi.loopvideo.network.download.FileManager
 import kotlinx.coroutines.launch
 
 /**
@@ -45,18 +44,19 @@ import kotlinx.coroutines.launch
 @Composable
 fun HomePage(homeViewModel: HomeViewModel = viewModel()) {
     val cxt = LocalContext.current
-    val downloader = remember { Downloader.getInstance(FileMananger.getInstance(cxt)) }
+    val downloader = remember { Downloader.getInstance(FileManager.getInstance(cxt)) }
     val scope = rememberCoroutineScope()
     val log by downloader.downloadTask.collectAsState()
-    Scaffold(
-        modifier = Modifier.fillMaxSize(),
+    Scaffold(modifier = Modifier.fillMaxSize(),
         contentWindowInsets = WindowInsets(top = 100.dp),
         topBar = {
             TopAppBar(title = { Text(text = "LoopVideo") })
         }) {
-        Box(modifier = Modifier
-            .padding(it)
-            .fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .padding(it)
+                .fillMaxSize()
+        ) {
             Button(onClick = {
                 scope.launch {
                     downloader.download("https://media.githubusercontent.com/media/CJChen98/Blog/master/video/video2.mp4")

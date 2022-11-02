@@ -6,10 +6,15 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.internal.closeQuietly
+import okhttp3.logging.HttpLoggingInterceptor
 import okio.buffer
 import okio.sink
 import java.io.File
@@ -24,13 +29,18 @@ import java.util.concurrent.TimeUnit
  **/
 private const val TAG = "Downloader"
 
-class Downloader private constructor(private val fileManager: FileMananger) {
+class Downloader private constructor(private val fileManager: FileManager) {
     private val client by lazy {
         OkHttpClient.Builder()
             .connectTimeout(0, TimeUnit.SECONDS)
             .callTimeout(0, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.SECONDS)
             .writeTimeout(0, TimeUnit.SECONDS)
+            .addInterceptor(HttpLoggingInterceptor {
+                Log.d("OkHttp", it)
+            }.apply {
+                level = HttpLoggingInterceptor.Level.HEADERS
+            })
             .build()
     }
     val downloadTask = MutableStateFlow<Map<String, DownloadInfo>>(emptyMap())
@@ -41,30 +51,53 @@ class Downloader private constructor(private val fileManager: FileMananger) {
     suspend fun download(url: String): Unit = withContext(Dispatchers.IO) {
         val request = Request.Builder().apply {
             url(url)
-            get()
         }.build()
         val downloadInfo: DownloadInfo = DownloadInfo.Waiting(url).apply { emit() }
-        suspend fun downloadStateUpdate(url: String, index: Int, progress: Float) {
-            val info = downloadTask.value.get(url)
+        val updateFlow =
+            MutableSharedFlow<DownloadInfo.Running.UpdateEvent>(
+                extraBufferCapacity = 10,
+                onBufferOverflow = BufferOverflow.DROP_OLDEST
+            )
+
+        suspend fun downloadStateUpdate(url: String, index: Int, saved: Long) {
+            val info = downloadTask.value[url]
             if (info is DownloadInfo.Running) {
-                info.update(index, progress).emit()
+                updateFlow.emit(DownloadInfo.Running.UpdateEvent(index, saved))
+            }
+        }
+        launch(Dispatchers.Default) {
+            updateFlow.collect { event ->
+                println(event)
+                val info = downloadTask.value[url]
+                if (info is DownloadInfo.Running) {
+                    val (index, saved) = event
+                    info.update(index, saved).emit()
+                }
             }
         }
         try {
             val call = client.newCall(request)
             val response = call.execute()
             val contentSize = response.body?.contentLength()
-            val file = createFile(response.headers["filename"] ?: url.split("/").last())
+            val filename = response.headers["content-disposition"]?.split(";")
+                ?.find { s ->
+                    s.startsWith("filename=")
+                }?.replace("filename=", "")
+                ?: url.split("/").last()
+            val file = createFile(filename)
+            log("download path = ${file.absolutePath}")
             val ranges = response.headers["accept-ranges"]
-
             val threadCount = if (contentSize == null || (ranges == null || ranges != "bytes")) {
                 1
             } else {
                 MAX_THREAD_COUNT
             }
-            log(response.headers)
-            downloadInfo.start(List(threadCount) { 0f }, file.absolutePath).emit()
-            log("download path = ${file.absolutePath}")
+            downloadInfo.start(
+                path = file.absolutePath,
+                threadCount = threadCount,
+                byteCount = response.body?.contentLength()!!
+            ).emit()
+            response.closeQuietly()
             val downloadList = mutableListOf<Deferred<Unit>>()
             repeat(threadCount) {
                 downloadList.add(async(start = CoroutineStart.LAZY) {
@@ -91,54 +124,49 @@ class Downloader private constructor(private val fileManager: FileMananger) {
         thread: Int,
         contentSize: Long?,
         threadCount: Int,
-        update: suspend (String, Int, Float) -> Unit
+        update: suspend (String, Int, Long) -> Unit
     ) {
         var start = 0L
         var end = 0L
-        var size: Long? = null
+        val size: Long?
         if (contentSize != null && threadCount > 1) {
             size = contentSize / threadCount
             start = thread * size
             end = if (thread == threadCount - 1) {
-                contentSize - 1
+                contentSize
             } else {
                 start + size - 1
             }
         }
+
         val request = Request.Builder().apply {
             url(url)
             get()
             if (contentSize != null && threadCount > 1) header("Range", "bytes=$start-$end")
         }.build()
-        val response = client.newCall(request).execute()
-        log("download thread$thread get header = ${response.headers}")
-        val body = response.body ?: throw  Exception("response body is null!")
-        body.source().use { source ->
-            val temp = RandomAccessFile(file, "rwd")
-            temp.seek(start)
-            FileOutputStream(temp.fd).sink().buffer().use { sink ->
-                val buffer = sink.buffer
-                var len: Long
-                var saved = 0L
-                val all = body.contentLength()/4096
-                var count = 0L
-                while (source.read(buffer, 4096L).also {
-                        len = it
-                        Log.d("source read", "thread-$thread: read len = $len")
-                    } != -1L) {
-                    sink.emit()
-                    Log.d("source read", "thread-$thread: emit (count = $count, all = $all)")
-                    saved += len
-                    count++
-                    update(
-                        url,
-                        thread,
-                        saved / (size ?: body.contentLength()).toFloat()
-                    )
+        val res = client.newCall(request).execute()
+        res.use { response ->
+            response.body?.source()?.use { source ->
+                val accessFile = RandomAccessFile(file, "rws")
+                accessFile.seek(start)
+                FileOutputStream(accessFile.fd).sink().buffer().use { sink ->
+                    val buffer = sink.buffer
+                    var len: Long
+                    var saved = 0L
+                    while (source.read(buffer, 4096L).also {
+                            len = it
+                        } != -1L) {
+                        sink.flush()
+                        saved += len
+                        update(
+                            url,
+                            thread,
+                            saved
+                        )
+                    }
                 }
-                Log.d("source read", "thread-$thread: read finish")
+                accessFile.closeQuietly()
             }
-            temp.close()
         }
     }
 
@@ -150,9 +178,9 @@ class Downloader private constructor(private val fileManager: FileMananger) {
     }
 
     companion object {
-        private const val MAX_THREAD_COUNT = 1
+        private const val MAX_THREAD_COUNT = 2
         private var instance: Downloader? = null
-        fun getInstance(fileManager: FileMananger): Downloader {
+        fun getInstance(fileManager: FileManager): Downloader {
             return instance ?: synchronized(this) {
                 instance ?: Downloader(fileManager).also {
                     instance = it
@@ -162,17 +190,25 @@ class Downloader private constructor(private val fileManager: FileMananger) {
     }
 
     private fun log(msg: Any) {
-        Log.d(TAG, msg.toString())
+//        Log.d(TAG, msg.toString())
+        print(msg)
     }
 }
 
 sealed class DownloadInfo(val url: String) {
     //    class Initialized(url: String) : DownloadInfo(url)
     class Waiting(url: String) : DownloadInfo(url) {
-        override fun start(progress: List<Float>, path: String): Running =
-            Running(url = url, progress = progress, path = path)
+        override fun start(threadCount: Int, byteCount: Long, path: String): Running =
+            Running(
+                url = url,
+                threadCount,
+                byteCount = byteCount,
+                path = path,
+                saved = 0,
+                process = List(threadCount) { 0L })
 
-        override fun pause(progress: List<Float>, path: String): Pause = unsupportedAction()
+        override fun pause(threadCount: Int, byteCount: Long, path: String): Pause =
+            unsupportedAction()
 
         override fun success(): Success = unsupportedAction()
 
@@ -184,11 +220,22 @@ sealed class DownloadInfo(val url: String) {
         }
     }
 
-    class Running(url: String, val path: String, val progress: List<Float>) : DownloadInfo(url) {
-        override fun start(progress: List<Float>, path: String): Running = unsupportedAction()
+    class Running(
+        url: String,
+        val threadCount: Int,
+        val path: String,
+        val process: List<Long>,
+        val byteCount: Long,
+        val saved: Long = 0L
+    ) :
+        DownloadInfo(url) {
+        data class UpdateEvent(val index: Int, val len: Long)
 
-        override fun pause(progress: List<Float>, path: String): Pause =
-            Pause(url, progress = progress, path = path)
+        override fun start(threadCount: Int, byteCount: Long, path: String): Running =
+            unsupportedAction()
+
+        override fun pause(threadCount: Int, byteCount: Long, path: String): Pause =
+            Pause(url, threadCount, path, process, byteCount, saved = saved)
 
         override fun success(): Success = Success(url)
 
@@ -196,37 +243,45 @@ sealed class DownloadInfo(val url: String) {
 
         override fun retry(): Waiting = unsupportedAction()
 
-        suspend fun update(index: Int, progress: Float): DownloadInfo {
-            val new = this.progress.toMutableList().apply {
-                set(index, progress)
+        fun update(index: Int, len: Long): DownloadInfo {
+            val newProgress = process.toMutableList().apply {
+                set(index, len)
             }
-            var total = 0f
-            new.forEach {
-                total += it
-            }
-            total /= new.size
-            return if (total >= 1f) {
+            var allSaved = 0L
+            newProgress.forEach { allSaved += it }
+            return if (allSaved >= byteCount) {
                 Success(url)
             } else {
-                Running(url, progress = new, path = path)
+                Running(
+                    url,
+                    path = path,
+                    byteCount = byteCount,
+                    process = newProgress,
+                    threadCount = threadCount,
+                    saved = allSaved
+                )
             }
         }
 
         override fun toString(): String {
-            var total = 0f
-            progress.forEach {
-                total += it
-            }
-            total /= progress.size
-            return "$url is downloading,progress =  ${total * 100}%"
+            return "$url is downloading,progress =  ${(saved * 100f) / byteCount}%\n" +
+                    "$process = $saved / $byteCount"
         }
     }
 
-    class Pause(url: String, val path: String, val progress: List<Float>) : DownloadInfo(url) {
-        override fun start(progress: List<Float>, path: String): Running =
-            Running(url, path, this.progress)
+    class Pause(
+        url: String,
+        val threadCount: Int,
+        val path: String,
+        val process: List<Long>,
+        val byteCount: Long,
+        val saved: Long = 0L
+    ) : DownloadInfo(url) {
+        override fun start(threadCount: Int, byteCount: Long, path: String): Running =
+            Running(url, threadCount, path, process, byteCount, saved = saved)
 
-        override fun pause(progress: List<Float>, path: String): Pause = unsupportedAction()
+        override fun pause(threadCount: Int, byteCount: Long, path: String): Pause =
+            unsupportedAction()
 
         override fun success(): Success = unsupportedAction()
 
@@ -239,9 +294,11 @@ sealed class DownloadInfo(val url: String) {
     }
 
     class Success(url: String) : DownloadInfo(url) {
-        override fun start(progress: List<Float>, path: String): Running = unsupportedAction()
+        override fun start(threadCount: Int, byteCount: Long, path: String): Running =
+            unsupportedAction()
 
-        override fun pause(progress: List<Float>, path: String): Pause = unsupportedAction()
+        override fun pause(threadCount: Int, byteCount: Long, path: String): Pause =
+            unsupportedAction()
 
         override fun success(): Success = unsupportedAction()
 
@@ -256,9 +313,11 @@ sealed class DownloadInfo(val url: String) {
 
     class Failed(url: String, val error: Throwable) : DownloadInfo(url) {
 
-        override fun start(progress: List<Float>, path: String): Running = unsupportedAction()
+        override fun start(threadCount: Int, byteCount: Long, path: String): Running =
+            unsupportedAction()
 
-        override fun pause(progress: List<Float>, path: String): Pause = unsupportedAction()
+        override fun pause(threadCount: Int, byteCount: Long, path: String): Pause =
+            unsupportedAction()
 
         override fun success(): Success = unsupportedAction()
 
@@ -271,9 +330,9 @@ sealed class DownloadInfo(val url: String) {
         }
     }
 
-    abstract fun start(progress: List<Float>, path: String): Running
+    abstract fun start(threadCount: Int, byteCount: Long, path: String): Running
 
-    abstract fun pause(progress: List<Float>, path: String): Pause
+    abstract fun pause(threadCount: Int, byteCount: Long, path: String): Pause
 
     abstract fun success(): Success
 

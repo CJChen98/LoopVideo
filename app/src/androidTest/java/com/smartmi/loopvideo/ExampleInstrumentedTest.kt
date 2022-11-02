@@ -4,7 +4,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.smartmi.loopvideo.network.download.DownloadInfo
 import com.smartmi.loopvideo.network.download.Downloader
-import com.smartmi.loopvideo.network.download.FileMananger
+import com.smartmi.loopvideo.network.download.FileManager
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -25,7 +25,7 @@ class ExampleInstrumentedTest {
         // Context of the app under test.
         val appContext = InstrumentationRegistry.getInstrumentation().targetContext
 //        assertEquals("com.smartmi.loopvideo", appContext.packageName)
-        val fileManager = FileMananger.getInstance(appContext)
+        val fileManager = FileManager.getInstance(appContext)
         val downloader = Downloader.getInstance(fileManager)
         runBlocking {
             launch { downloader.download("https://media.githubusercontent.com/media/CJChen98/Blog/master/video/video2.mp4") }
