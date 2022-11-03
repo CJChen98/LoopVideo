@@ -48,7 +48,7 @@ class Downloader private constructor(private val fileManager: FileManager) {
         return fileManager.createFile(filename)
     }
 
-    suspend fun download(url: String): Unit = withContext(Dispatchers.IO) {
+    suspend fun download(url: String,threadCount: Int = MAX_THREAD_COUNT): Unit = withContext(Dispatchers.IO) {
         val request = Request.Builder().apply {
             url(url)
         }.build()
@@ -87,26 +87,26 @@ class Downloader private constructor(private val fileManager: FileManager) {
             val file = createFile(filename)
             log("download path = ${file.absolutePath}")
             val ranges = response.headers["accept-ranges"]
-            val threadCount = if (contentSize == null || (ranges == null || ranges != "bytes")) {
+            val tCount = if (contentSize == null || (ranges == null || ranges != "bytes")) {
                 1
             } else {
-                MAX_THREAD_COUNT
+                threadCount.coerceAtMost(MAX_THREAD_COUNT)
             }
             downloadInfo.start(
                 path = file.absolutePath,
-                threadCount = threadCount,
+                threadCount = tCount,
                 byteCount = response.body?.contentLength()!!
             ).emit()
             response.closeQuietly()
             val downloadList = mutableListOf<Deferred<Unit>>()
-            repeat(threadCount) {
+            repeat(tCount) {
                 downloadList.add(async(start = CoroutineStart.LAZY) {
                     _download(
                         url,
                         file,
                         thread = it,
                         contentSize,
-                        threadCount,
+                        tCount,
                         ::downloadStateUpdate
                     )
                 })
@@ -178,7 +178,7 @@ class Downloader private constructor(private val fileManager: FileManager) {
     }
 
     companion object {
-        private const val MAX_THREAD_COUNT = 2
+        private const val MAX_THREAD_COUNT = 8
         private var instance: Downloader? = null
         fun getInstance(fileManager: FileManager): Downloader {
             return instance ?: synchronized(this) {
@@ -237,7 +237,7 @@ sealed class DownloadInfo(val url: String) {
         override fun pause(threadCount: Int, byteCount: Long, path: String): Pause =
             Pause(url, threadCount, path, process, byteCount, saved = saved)
 
-        override fun success(): Success = Success(url)
+        override fun success(): Success = Success(url, path)
 
         override fun failed(thr: Throwable): Failed = Failed(url, thr)
 
@@ -250,7 +250,7 @@ sealed class DownloadInfo(val url: String) {
             var allSaved = 0L
             newProgress.forEach { allSaved += it }
             return if (allSaved >= byteCount) {
-                Success(url)
+                success()
             } else {
                 Running(
                     url,
@@ -263,8 +263,11 @@ sealed class DownloadInfo(val url: String) {
             }
         }
 
+        val percent: String
+            get() = String.format("%.2f", (saved * 100f) / byteCount) + "%"
+
         override fun toString(): String {
-            return "$url is downloading,progress =  ${(saved * 100f) / byteCount}%\n" +
+            return "$url is downloading,progress =  $percent\n" +
                     "$process = $saved / $byteCount"
         }
     }
@@ -291,9 +294,11 @@ sealed class DownloadInfo(val url: String) {
         override fun toString(): String {
             return "$url is pausing"
         }
+        val percent: String
+            get() = String.format("%.2f", (saved * 100f) / byteCount) + "%"
     }
 
-    class Success(url: String) : DownloadInfo(url) {
+    class Success(url: String, val path: String) : DownloadInfo(url) {
         override fun start(threadCount: Int, byteCount: Long, path: String): Running =
             unsupportedAction()
 
